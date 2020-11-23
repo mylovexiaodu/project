@@ -1,0 +1,732 @@
+package cc.mrbird.febs.server.system.utils;
+
+import cc.mrbird.febs.common.core.model.ZcsxDataModel;
+import io.minio.MinioClient;
+import lombok.extern.slf4j.Slf4j;
+import org.docx4j.Docx4J;
+import org.docx4j.TraversalUtil;
+import org.docx4j.XmlUtils;
+import org.docx4j.dml.wordprocessingDrawing.Inline;
+import org.docx4j.finders.ClassFinder;
+import org.docx4j.fonts.*;
+import org.docx4j.jaxb.Context;
+import org.docx4j.openpackaging.packages.WordprocessingMLPackage;
+import org.docx4j.openpackaging.parts.WordprocessingML.BinaryPartAbstractImage;
+import org.docx4j.openpackaging.parts.WordprocessingML.MainDocumentPart;
+import org.docx4j.wml.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import javax.servlet.http.HttpServletResponse;
+import javax.xml.bind.JAXBElement;
+import javax.xml.bind.JAXBException;
+import java.io.*;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+@Slf4j
+@Component
+public class CommontUtil {
+
+    @Value("${minio.endpoint}")
+    private String endpoint;
+
+    @Value("${minio.accesskey}")
+    private String accessKey;
+
+    @Value("${minio.secretkey}")
+    private String secretKey;
+
+    @Autowired
+    private MinioUtil minioUtil;
+
+
+    /**
+     * 将模板静态化，并且进行保存
+     *
+     * @param paramsData   静态化参数封装
+     * @param images       系统静态化图片参数
+     * @param templatePath 模板路径
+     * @param savePath     文件保存路径
+     * @throws Exception
+     */
+    public void exportWord(Map<String, String> paramsData, Map<String, Object> images, String templatePath, String savePath, ZcsxDataModel zcsxDataModel) throws Exception {
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        MinioClient client = getClient();
+        InputStream wordInputStream = client.getObject("system", templatePath);
+        String separator = File.separator;
+        String[] wordName = savePath.split("\\" + separator);
+        this.fillTemplateExportWord(paramsData, wordInputStream, outputStream, images, zcsxDataModel, wordName[2]);
+        File file = new File(savePath);
+        FileOutputStream fos = new FileOutputStream(file);
+        outputStream.writeTo(fos);
+        closeStream(wordInputStream, outputStream);
+        /*InputStream in = new ByteArrayInputStream(outputStream.toByteArray());
+        String url = "contract_template_data/"+ wordName[2]+".docx";
+        minioUtil.upload("contract",url,in);*/
+        if (fos != null) {
+            try {
+                fos.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
+    }
+
+    /**
+     * 静态化Word模板
+     *
+     * @param params           静态化宏参数封装
+     * @param wordInputStream  模板IO信息
+     * @param docxOutputStream 输出静态化的docx信息IO
+     * @param images           签名或者模板需要静态化图片的信息
+     */
+    public static void fillTemplateExportWord(Map<String, String> params, InputStream wordInputStream, OutputStream docxOutputStream, Map<String, Object> images, ZcsxDataModel zcsxDataModel, String wordName) throws Exception {
+        WordprocessingMLPackage wordMLPackage;
+        try {
+            wordMLPackage = WordprocessingMLPackage.load(wordInputStream);
+            configSimSunFont(wordMLPackage);
+            Mapper fontMapper = new BestMatchingMapper();
+            wordMLPackage.setFontMapper(fontMapper);
+            MainDocumentPart mainDocumentPart = wordMLPackage.getMainDocumentPart();
+            //构造循环列表的数据
+            ClassFinder find = new ClassFinder(Tbl.class);
+            new TraversalUtil(wordMLPackage.getMainDocumentPart().getContent(), find);
+            setData(zcsxDataModel, wordName, find);
+            mainDocumentPart.variableReplace(params);
+            if (images != null) replaceImage(wordMLPackage, images);
+            Docx4J.save(wordMLPackage, docxOutputStream);
+        } catch (Exception e) {
+            log.error("Docx4JException e", e);
+            throw new Exception("静态化word失败");
+        }
+    }
+
+    //设置表格遍历
+    private static void setData(ZcsxDataModel zcsxDataModel, String wordName, ClassFinder find) throws JAXBException {
+        if (wordName.equals("授信调查报告（流动资金融资担保类）.docx")) {
+            /**有合计的，不规则的列表参考 start*/
+            Tbl table = (Tbl) find.results.get(3);//第四个表报模板
+            Tr dynamicTr = (Tr) table.getContent().get(7);//该表报模板的第8行约定为模板
+            Tr hjTr = (Tr) table.getContent().get(8);//模板合计那行的占位
+            Tr phTr = (Tr) table.getContent().get(9);//模板实际控制人及其配偶那行的占位
+            Tr guanliTr0 = (Tr) table.getContent().get(10);//关联企业名称等的占位,
+            Tr guanliTr = (Tr) table.getContent().get(11);//关联企业名称等模板站位
+            String dynamicTrXml = XmlUtils.marshaltoString(dynamicTr);//获取模板行的xml数据
+            for (Map<String, Object> dataMap : zcsxDataModel.getCrmStockList()) {
+                Tr newTr = (Tr) XmlUtils.unmarshallFromTemplate(dynamicTrXml, dataMap);//填充模板行数据
+                table.getContent().add(newTr);
+            }
+
+            //自此列表已经完成
+            //合计那行插入
+            table.getContent().add(hjTr);
+            //删除模板行的占位
+            table.getContent().remove(7);
+            //删除模板合计那行的占位
+            table.getContent().remove(7);
+            //删除实际控制人及其配偶那行的占位
+            table.getContent().remove(7);
+            //删除关联企业名称等的占位
+            table.getContent().remove(7);
+            //删除关联企业名称等模板站位
+            table.getContent().remove(7);
+            //重新插入
+            table.getContent().add(phTr);
+            table.getContent().add(guanliTr0);
+            table.getContent().add(guanliTr);
+
+            String dynamicTrXml2 = XmlUtils.marshaltoString(guanliTr);//获取模板行的xml数据
+
+            for (Map<String, Object> dataMap : zcsxDataModel.getCrmRelationclientList()) {
+                Tr newTr = (Tr) XmlUtils.unmarshallFromTemplate(dynamicTrXml2, dataMap);//填充模板行数据
+                table.getContent().add(newTr);
+            }
+            //删除关联企业名称等模板行的占位
+            table.getContent().remove(7 + 3 + zcsxDataModel.getCrmStockList().size());
+            //关于13的计算  7（dynamicTr所在行数）+3（dataList.size()）+3（重新插入行数）
+            /**      有合计的，不规则的列表参考 end         */
+            //抵押--不动产
+            Tbl table16 = (Tbl) find.results.get(16);
+            Tr dynamicTr16 = (Tr) table16.getContent().get(1);//第二行约定为模板
+            Tr Tr2 = (Tr) table16.getContent().get(2);//模板合计那行的占位
+            Tr Tr3 = (Tr) table16.getContent().get(3);//模板实际控制人及其配偶那行的占位
+            Tr Tr4 = (Tr) table16.getContent().get(4);//关联企业名称等的占位,
+            Tr Tr5 = (Tr) table16.getContent().get(5);//关联企业名称等模板站位
+            Tr Tr6 = (Tr) table16.getContent().get(6);//关联企业名称等模板站位
+            Tr Tr7 = (Tr) table16.getContent().get(7);//关联企业名称等模板站位
+            Tr Tr8 = (Tr) table16.getContent().get(8);//关联企业名称等模板站位
+            String dynamicTrXml16 = XmlUtils.marshaltoString(dynamicTr16);//获取模板行的xml数据
+            for (Map<String, Object> dataMap : zcsxDataModel.getProOptguarantyMortgageRList()) {
+                Tr newTr = (Tr) XmlUtils.unmarshallFromTemplate(dynamicTrXml16, dataMap);//填充模板行数据
+                table16.getContent().add(newTr);
+            }
+            //删除模板行的占位
+            table16.getContent().remove(1);
+            table16.getContent().remove(1);
+            table16.getContent().remove(1);
+            table16.getContent().remove(1);
+            table16.getContent().remove(1);
+            table16.getContent().remove(1);
+            table16.getContent().remove(1);
+            table16.getContent().remove(1);
+            //重新插入
+            table16.getContent().add(Tr2);
+            table16.getContent().add(Tr3);
+            table16.getContent().add(Tr4);
+            table16.getContent().add(Tr5);
+            table16.getContent().add(Tr6);
+            table16.getContent().add(Tr7);
+            table16.getContent().add(Tr8);
+            //抵押--动产
+            Tbl table17 = (Tbl) find.results.get(17);
+            Tr dynamicTr17 = (Tr) table17.getContent().get(1);//第二行约定为模板
+            Tr TrP2 = (Tr) table17.getContent().get(2);//模板合计那行的占位
+            Tr TrP3 = (Tr) table17.getContent().get(3);//模板实际控制人及其配偶那行的占位
+            Tr TrP4 = (Tr) table17.getContent().get(4);//关联企业名称等的占位,
+            Tr TrP5 = (Tr) table17.getContent().get(5);//关联企业名称等模板站位
+            Tr TrP6 = (Tr) table17.getContent().get(6);//关联企业名称等模板站位
+            Tr TrP7 = (Tr) table17.getContent().get(7);//关联企业名称等模板站位
+            Tr TrP8 = (Tr) table17.getContent().get(8);//关联企业名称等模板站位
+            String dynamicTrXml17 = XmlUtils.marshaltoString(dynamicTr17);//获取模板行的xml数据
+            for (Map<String, Object> dataMap : zcsxDataModel.getProOptguarantyMortgagePList()) {
+                Tr newTr = (Tr) XmlUtils.unmarshallFromTemplate(dynamicTrXml17, dataMap);//填充模板行数据
+                table17.getContent().add(newTr);
+            }
+            //删除模板行的占位
+            table17.getContent().remove(1);
+            table17.getContent().remove(1);
+            table17.getContent().remove(1);
+            table17.getContent().remove(1);
+            table17.getContent().remove(1);
+            table17.getContent().remove(1);
+            table17.getContent().remove(1);
+            table17.getContent().remove(1);
+            //重新插入
+            table17.getContent().add(TrP2);
+            table17.getContent().add(TrP3);
+            table17.getContent().add(TrP4);
+            table17.getContent().add(TrP5);
+            table17.getContent().add(TrP6);
+            table17.getContent().add(TrP7);
+            table17.getContent().add(TrP8);
+
+            //质押
+            Tbl table18 = (Tbl) find.results.get(18);
+            Tr dynamicTr18 = (Tr) table18.getContent().get(1);//第二行约定为模板
+            Tr PledgeTr2 = (Tr) table18.getContent().get(2);//模板合计那行的占位
+            Tr PledgeTr3 = (Tr) table18.getContent().get(3);//模板实际控制人及其配偶那行的占位
+            Tr PledgeTr4 = (Tr) table18.getContent().get(4);//关联企业名称等的占位,
+            Tr PledgeTr5 = (Tr) table18.getContent().get(5);//关联企业名称等模板站位
+            Tr PledgeTr6 = (Tr) table18.getContent().get(6);//关联企业名称等模板站位
+            Tr PledgeTr7 = (Tr) table18.getContent().get(7);//关联企业名称等模板站位
+            Tr PledgeTr8 = (Tr) table18.getContent().get(8);//关联企业名称等模板站位
+            String dynamicTrXml18 = XmlUtils.marshaltoString(dynamicTr18);//获取模板行的xml数据
+            for (Map<String, Object> dataMap : zcsxDataModel.getProOptguarantyPledgeList()) {
+                Tr newTr = (Tr) XmlUtils.unmarshallFromTemplate(dynamicTrXml18, dataMap);//填充模板行数据
+                table18.getContent().add(newTr);
+            }
+            //删除模板行的占位
+            table18.getContent().remove(1);
+            table18.getContent().remove(1);
+            table18.getContent().remove(1);
+            table18.getContent().remove(1);
+            table18.getContent().remove(1);
+            table18.getContent().remove(1);
+            table18.getContent().remove(1);
+            table18.getContent().remove(1);
+            //重新插入
+            table18.getContent().add(PledgeTr2);
+            table18.getContent().add(PledgeTr3);
+            table18.getContent().add(PledgeTr4);
+            table18.getContent().add(PledgeTr5);
+            table18.getContent().add(PledgeTr6);
+            table18.getContent().add(PledgeTr7);
+            table18.getContent().add(PledgeTr8);
+
+            Tbl table19 = (Tbl) find.results.get(19);
+            Tr dynamicTr19 = (Tr) table19.getContent().get(8);//第二行约定为模板
+            String dynamicTrXm19 = XmlUtils.marshaltoString(dynamicTr19);//获取模板行的xml数据
+            for (Map<String, Object> dataMap : zcsxDataModel.getCrmStockList()) {
+                Tr newTr = (Tr) XmlUtils.unmarshallFromTemplate(dynamicTrXm19, dataMap);//填充模板行数据
+                table19.getContent().add(newTr);
+            }
+            //删除模板行的占位
+            table19.getContent().remove(8);
+        }
+        if(wordName.equals("附件6.南宁市南方融资担保有限公司流动资金融资担保业务操作指引.docx")){
+            /**有合计的，不规则的列表参考 start*/
+            Tbl table = (Tbl) find.results.get(5);//第四个表报模板
+            Tr dynamicTr = (Tr) table.getContent().get(7);//该表报模板的第8行约定为模板
+            Tr hjTr = (Tr) table.getContent().get(8);//模板合计那行的占位
+            Tr phTr = (Tr) table.getContent().get(9);//模板实际控制人及其配偶那行的占位
+            Tr guanliTr0 = (Tr) table.getContent().get(10);//关联企业名称等的占位,
+            Tr guanliTr = (Tr) table.getContent().get(11);//关联企业名称等模板站位
+            String dynamicTrXml = XmlUtils.marshaltoString(dynamicTr);//获取模板行的xml数据
+            for (Map<String, Object> dataMap : zcsxDataModel.getCrmStockList()) {
+                Tr newTr = (Tr) XmlUtils.unmarshallFromTemplate(dynamicTrXml, dataMap);//填充模板行数据
+                table.getContent().add(newTr);
+            }
+
+            //自此列表已经完成
+            //合计那行插入
+            table.getContent().add(hjTr);
+            //删除模板行的占位
+            table.getContent().remove(7);
+            //删除模板合计那行的占位
+            table.getContent().remove(7);
+            //删除实际控制人及其配偶那行的占位
+            table.getContent().remove(7);
+            //删除关联企业名称等的占位
+            table.getContent().remove(7);
+            //删除关联企业名称等模板站位
+            table.getContent().remove(7);
+            //重新插入
+            table.getContent().add(phTr);
+            table.getContent().add(guanliTr0);
+            table.getContent().add(guanliTr);
+
+            String dynamicTrXml2 = XmlUtils.marshaltoString(guanliTr);//获取模板行的xml数据
+
+            for (Map<String, Object> dataMap : zcsxDataModel.getCrmRelationclientList()) {
+                Tr newTr = (Tr) XmlUtils.unmarshallFromTemplate(dynamicTrXml2, dataMap);//填充模板行数据
+                table.getContent().add(newTr);
+            }
+            //删除关联企业名称等模板行的占位
+            table.getContent().remove(7 + 3 + zcsxDataModel.getCrmStockList().size());
+            //关于13的计算  7（dynamicTr所在行数）+3（dataList.size()）+3（重新插入行数）
+            /**      有合计的，不规则的列表参考 end         */
+            //抵押--不动产
+            Tbl table18 = (Tbl) find.results.get(18);
+            Tr dynamicTr18 = (Tr) table18.getContent().get(1);//第二行约定为模板
+            Tr Tr2 = (Tr) table18.getContent().get(2);//模板合计那行的占位
+            Tr Tr3 = (Tr) table18.getContent().get(3);//模板实际控制人及其配偶那行的占位
+            Tr Tr4 = (Tr) table18.getContent().get(4);//关联企业名称等的占位,
+            Tr Tr5 = (Tr) table18.getContent().get(5);//关联企业名称等模板站位
+            Tr Tr6 = (Tr) table18.getContent().get(6);//关联企业名称等模板站位
+            Tr Tr7 = (Tr) table18.getContent().get(7);//关联企业名称等模板站位
+            Tr Tr8 = (Tr) table18.getContent().get(8);//关联企业名称等模板站位
+            String dynamicTrXml18 = XmlUtils.marshaltoString(dynamicTr18);//获取模板行的xml数据
+            for (Map<String, Object> dataMap : zcsxDataModel.getProOptguarantyMortgageRList()) {
+                Tr newTr = (Tr) XmlUtils.unmarshallFromTemplate(dynamicTrXml18, dataMap);//填充模板行数据
+                table18.getContent().add(newTr);
+            }
+            //删除模板行的占位
+            table18.getContent().remove(1);
+            table18.getContent().remove(1);
+            table18.getContent().remove(1);
+            table18.getContent().remove(1);
+            table18.getContent().remove(1);
+            table18.getContent().remove(1);
+            table18.getContent().remove(1);
+            table18.getContent().remove(1);
+            //重新插入
+            table18.getContent().add(Tr2);
+            table18.getContent().add(Tr3);
+            table18.getContent().add(Tr4);
+            table18.getContent().add(Tr5);
+            table18.getContent().add(Tr6);
+            table18.getContent().add(Tr7);
+            table18.getContent().add(Tr8);
+            //抵押--动产
+            Tbl table19 = (Tbl) find.results.get(19);
+            Tr dynamicTr19 = (Tr) table19.getContent().get(1);//第二行约定为模板
+            Tr TrP2 = (Tr) table19.getContent().get(2);//模板合计那行的占位
+            Tr TrP3 = (Tr) table19.getContent().get(3);//模板实际控制人及其配偶那行的占位
+            Tr TrP4 = (Tr) table19.getContent().get(4);//关联企业名称等的占位,
+            Tr TrP5 = (Tr) table19.getContent().get(5);//关联企业名称等模板站位
+            Tr TrP6 = (Tr) table19.getContent().get(6);//关联企业名称等模板站位
+            Tr TrP7 = (Tr) table19.getContent().get(7);//关联企业名称等模板站位
+            Tr TrP8 = (Tr) table19.getContent().get(8);//关联企业名称等模板站位
+            String dynamicTrXml19 = XmlUtils.marshaltoString(dynamicTr19);//获取模板行的xml数据
+            for (Map<String, Object> dataMap : zcsxDataModel.getProOptguarantyMortgagePList()) {
+                Tr newTr = (Tr) XmlUtils.unmarshallFromTemplate(dynamicTrXml19, dataMap);//填充模板行数据
+                table19.getContent().add(newTr);
+            }
+            //删除模板行的占位
+            table19.getContent().remove(1);
+            table19.getContent().remove(1);
+            table19.getContent().remove(1);
+            table19.getContent().remove(1);
+            table19.getContent().remove(1);
+            table19.getContent().remove(1);
+            table19.getContent().remove(1);
+            table19.getContent().remove(1);
+            //重新插入
+            table19.getContent().add(TrP2);
+            table19.getContent().add(TrP3);
+            table19.getContent().add(TrP4);
+            table19.getContent().add(TrP5);
+            table19.getContent().add(TrP6);
+            table19.getContent().add(TrP7);
+            table19.getContent().add(TrP8);
+
+            //质押
+            Tbl table20 = (Tbl) find.results.get(20);
+            Tr dynamicTr20 = (Tr) table20.getContent().get(1);//第二行约定为模板
+            Tr PledgeTr2 = (Tr) table20.getContent().get(2);//模板合计那行的占位
+            Tr PledgeTr3 = (Tr) table20.getContent().get(3);//模板实际控制人及其配偶那行的占位
+            Tr PledgeTr4 = (Tr) table20.getContent().get(4);//关联企业名称等的占位,
+            Tr PledgeTr5 = (Tr) table20.getContent().get(5);//关联企业名称等模板站位
+            Tr PledgeTr6 = (Tr) table20.getContent().get(6);//关联企业名称等模板站位
+            Tr PledgeTr7 = (Tr) table20.getContent().get(7);//关联企业名称等模板站位
+            Tr PledgeTr8 = (Tr) table20.getContent().get(8);//关联企业名称等模板站位
+            String dynamicTrXml20 = XmlUtils.marshaltoString(dynamicTr20);//获取模板行的xml数据
+            for (Map<String, Object> dataMap : zcsxDataModel.getProOptguarantyPledgeList()) {
+                Tr newTr = (Tr) XmlUtils.unmarshallFromTemplate(dynamicTrXml20, dataMap);//填充模板行数据
+                table20.getContent().add(newTr);
+            }
+            //删除模板行的占位
+            table20.getContent().remove(1);
+            table20.getContent().remove(1);
+            table20.getContent().remove(1);
+            table20.getContent().remove(1);
+            table20.getContent().remove(1);
+            table20.getContent().remove(1);
+            table20.getContent().remove(1);
+            table20.getContent().remove(1);
+            //重新插入
+            table20.getContent().add(PledgeTr2);
+            table20.getContent().add(PledgeTr3);
+            table20.getContent().add(PledgeTr4);
+            table20.getContent().add(PledgeTr5);
+            table20.getContent().add(PledgeTr6);
+            table20.getContent().add(PledgeTr7);
+            table20.getContent().add(PledgeTr8);
+
+            Tbl table21 = (Tbl) find.results.get(21);
+            Tr dynamicTr21 = (Tr) table21.getContent().get(8);//第二行约定为模板
+            String dynamicTrXm21 = XmlUtils.marshaltoString(dynamicTr21);//获取模板行的xml数据
+            for (Map<String, Object> dataMap : zcsxDataModel.getCrmStockList()) {
+                Tr newTr = (Tr) XmlUtils.unmarshallFromTemplate(dynamicTrXm21, dataMap);//填充模板行数据
+                table21.getContent().add(newTr);
+            }
+            //删除模板行的占位
+            table21.getContent().remove(8);
+
+        }
+    }
+
+    public void closeStream(InputStream in, OutputStream out) {
+        if (in != null) {
+            try {
+                in.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+        if (out != null) {
+            try {
+                out.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private static void replaceImage(WordprocessingMLPackage wordMLPackage, Map<String, Object> images) throws Exception {
+        List<Object> texts = getAllElementFromObject(wordMLPackage.getMainDocumentPart(), Text.class);
+        for (Object text : texts) {
+            Text content = (Text) text;
+            for (Map.Entry<String, Object> stringEntry : images.entrySet()) {
+                if (content.getValue().equals(stringEntry.getKey())) {
+                    if (stringEntry.getValue() instanceof List) {
+                        if (stringEntry.getKey().contains("businessLicensPic")) {
+                            List<byte[]> list = (List<byte[]>) stringEntry.getValue();
+                            log.info("---------------------营业执照list.size():{}------------------------", list.size());
+                            R r = (R) content.getParent();
+                            r.getContent().clear();
+                            P p = (P) r.getParent();
+                            int i = 1;
+                            for (byte[] bytes : list) {
+                                log.info("---------------------第{}个------------------------", i++);
+                                p.getContent().add(addPageBreak());
+                                if (i == 2) {
+                                    log.info("---------------------营业执照加文字说明------------------------");
+                                    p.getContent().add(addBusinessLicensText());
+                                }
+                                p.getContent().add(newImageTwo(wordMLPackage, bytes, null, null));
+                            }
+                        } else {
+                            List<byte[]> list = (List<byte[]>) stringEntry.getValue();
+                            log.info("---------------------财力证明list.size():{}------------------------", list.size());
+                            R r = (R) content.getParent();
+                            r.getContent().clear();
+                            P p = (P) r.getParent();
+                            int i = 1;
+                            for (byte[] bytes : list) {
+                                log.info("---------------------第{}个------------------------", i++);
+                                p.getContent().add(addPageBreak());
+                                if (i == 2) {
+                                    log.info("---------------------财力证明加文字说明------------------------");
+                                    p.getContent().add(addText());
+                                }
+                                p.getContent().add(newImageTwo(wordMLPackage, bytes, null, null));
+                            }
+                        }
+                    } else {
+                        byte[] bytes = (byte[]) stringEntry.getValue();
+                        R r = (R) content.getParent();
+                        r.getContent().clear();
+                        P p = (P) r.getParent();
+                        if ("applySignPic".equals(stringEntry.getKey()) || "vouchSignPic".equals(stringEntry.getKey())) {//签名另外的高度
+                            p.getContent().add(newImageThree(wordMLPackage, bytes, null, null));
+                        } else {
+                            p.getContent().add(newImage(wordMLPackage, bytes, null, null));
+                        }
+                    }
+                }
+            }
+
+        }
+    }
+
+    private static R newImage(WordprocessingMLPackage wordMLPackage,
+                              byte[] bytes,
+                              String filenameHint, String altText) throws Exception {
+        int id1 = (int) ((Math.random() * 1000) * (Math.random() * 1000));
+        int id2 = (int) ((Math.random() * 1000) * (Math.random() * 1000));
+        BinaryPartAbstractImage imagePart = BinaryPartAbstractImage.createImagePart(wordMLPackage, bytes);
+
+        Inline inline = imagePart.createImageInline(filenameHint, altText, id1, id2, false, 4000);
+        ObjectFactory factory = Context.getWmlObjectFactory();
+        R run = factory.createR();
+        Drawing drawing = factory.createDrawing();
+        run.getContent().add(drawing);
+        drawing.getAnchorOrInline().add(inline);
+        return run;
+
+    }
+
+    private static R newImageThree(WordprocessingMLPackage wordMLPackage,
+                                   byte[] bytes,
+                                   String filenameHint, String altText) throws Exception {
+        int id1 = (int) ((Math.random() * 1000) * (Math.random() * 1000));
+        int id2 = (int) ((Math.random() * 1000) * (Math.random() * 1000));
+        BinaryPartAbstractImage imagePart = BinaryPartAbstractImage.createImagePart(wordMLPackage, bytes);
+
+        Inline inline = imagePart.createImageInline(filenameHint, altText, id1, id2, false, 2500);
+        ObjectFactory factory = Context.getWmlObjectFactory();
+        R run = factory.createR();
+        Drawing drawing = factory.createDrawing();
+        run.getContent().add(drawing);
+        drawing.getAnchorOrInline().add(inline);
+        return run;
+
+    }
+
+    private static R addText() {
+        ObjectFactory factory = Context.getWmlObjectFactory();
+        Text t = factory.createText();
+        t.setValue("财力证明：");
+        Br breakObj = new Br();
+        breakObj.setType(STBrType.TEXT_WRAPPING);
+
+        R run = factory.createR();
+        run.getContent().add(t);
+        run.getContent().add(breakObj);
+        return run;
+
+    }
+
+    private static R newImageTwo(WordprocessingMLPackage wordMLPackage,
+                                 byte[] bytes,
+                                 String filenameHint, String altText) throws Exception {
+        int id1 = (int) ((Math.random() * 1000) * (Math.random() * 1000));
+        int id2 = (int) ((Math.random() * 1000) * (Math.random() * 1000));
+        BinaryPartAbstractImage imagePart = BinaryPartAbstractImage.createImagePart(wordMLPackage, bytes);
+
+        Inline inline = imagePart.createImageInline(filenameHint, altText, id1, id2, false, 11000);
+        ObjectFactory factory = Context.getWmlObjectFactory();
+        R run = factory.createR();
+        Drawing drawing = factory.createDrawing();
+        run.getContent().add(drawing);
+        drawing.getAnchorOrInline().add(inline);
+        return run;
+
+    }
+
+    private static R addBusinessLicensText() {
+        ObjectFactory factory = Context.getWmlObjectFactory();
+        Text t = factory.createText();
+        t.setValue("营业执照：");
+        Br breakObj = new Br();
+        breakObj.setType(STBrType.TEXT_WRAPPING);
+
+        R run = factory.createR();
+        run.getContent().add(t);
+        run.getContent().add(breakObj);
+        return run;
+
+    }
+
+    private static R addPageBreak() {
+        Br breakObj = new Br();
+        breakObj.setType(STBrType.PAGE);
+
+        ObjectFactory factory = Context.getWmlObjectFactory();
+        R run = factory.createR();
+        run.getContent().add(breakObj);
+        return run;
+
+    }
+
+    /**
+     * 遍历所有的Text，或者Table，或者R或者P等等
+     *
+     * @param obj
+     * @param toSearch
+     * @return
+     */
+    private static List<Object> getAllElementFromObject(Object obj, Class<?> toSearch) {
+        List<Object> result = new ArrayList<Object>();
+        if (obj instanceof JAXBElement)
+            obj = ((JAXBElement<?>) obj).getValue();
+
+        if (obj.getClass().equals(toSearch))
+            result.add(obj);
+        else if (obj instanceof ContentAccessor) {
+            List<?> children = ((ContentAccessor) obj).getContent();
+            for (Object child : children) {
+                result.addAll(getAllElementFromObject(child, toSearch));
+            }
+
+        }
+        return result;
+    }
+
+    protected static void configSimSunFont(WordprocessingMLPackage wordMLPackage) {
+        Mapper fontMapper = new IdentityPlusMapper();
+        try {
+            wordMLPackage.setFontMapper(fontMapper);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        String fontFamily = "SimSun";
+        URL simsunUrl = CommontUtil.class.getResource("/simsun.ttc"); //加载字体文件（解决linux环境下无中文字体问题）
+        PhysicalFonts.addPhysicalFonts(fontFamily, simsunUrl);
+        PhysicalFont simsunFont = PhysicalFonts.get(fontFamily);
+        fontMapper.put(fontFamily, simsunFont);
+        fontMapper.put("宋体", PhysicalFonts.get("SimSun"));
+        fontMapper.put("隶书", PhysicalFonts.get("LiSu"));
+        fontMapper.put("微软雅黑", PhysicalFonts.get("Microsoft Yahei"));
+        fontMapper.put("黑体", PhysicalFonts.get("SimHei"));
+        fontMapper.put("楷体", PhysicalFonts.get("KaiTi"));
+        fontMapper.put("新宋体", PhysicalFonts.get("NSimSun"));
+        fontMapper.put("华文行楷", PhysicalFonts.get("STXingkai"));
+        fontMapper.put("华文仿宋", PhysicalFonts.get("STFangsong"));
+        fontMapper.put("宋体扩展", PhysicalFonts.get("simsun-extB"));
+        fontMapper.put("仿宋", PhysicalFonts.get("FangSong"));
+        fontMapper.put("仿宋_GB2312", PhysicalFonts.get("FangSong_GB2312"));
+        fontMapper.put("幼圆", PhysicalFonts.get("YouYuan"));
+        fontMapper.put("华文宋体", PhysicalFonts.get("STSong"));
+        fontMapper.put("华文中宋", PhysicalFonts.get("STZhongsong"));
+
+        RFonts rfonts = Context.getWmlObjectFactory().createRFonts(); //设置文件默认字体
+        rfonts.setAsciiTheme(null);
+        rfonts.setAscii(fontFamily);
+        wordMLPackage.getMainDocumentPart().getPropertyResolver().getDocumentDefaultRPr().setRFonts(rfonts);
+    }
+
+    /**
+     * 获取minio客户端
+     *
+     * @return 连接信息
+     * @throws Exception 异常信息
+     */
+    public MinioClient getClient() throws Exception {
+        MinioClient minioClient = new MinioClient(endpoint, accessKey, secretKey);
+        long time = 5 * 60 * 1000;
+        minioClient.setTimeout(time, time, time);
+        return minioClient;
+    }
+
+    /**
+     * @功能 下载临时素材接口
+     * @param filePath 文件将要保存的目录
+     * @param method 请求方法，包括POST和GET
+     * @param url 请求的路径
+     * @return
+     */
+
+    public static File saveUrlAs(String url,String filePath,String method){
+        //System.out.println("fileName---->"+filePath);
+        //创建不同的文件夹目录
+        File file=new File(filePath);
+        //判断文件夹是否存在
+        if (!file.exists())
+        {
+            //如果文件夹不存在，则创建新的的文件夹
+            file.mkdirs();
+        }
+        FileOutputStream fileOut = null;
+        HttpURLConnection conn = null;
+        InputStream inputStream = null;
+        try
+        {
+            // 建立链接
+            URL httpUrl=new URL(url);
+            conn=(HttpURLConnection) httpUrl.openConnection();
+            //以Post方式提交表单，默认get方式
+            conn.setRequestMethod(method);
+            conn.setDoInput(true);
+            conn.setDoOutput(true);
+            // post方式不能使用缓存
+            conn.setUseCaches(false);
+            //连接指定的资源
+            conn.connect();
+            //获取网络输入流
+            inputStream=conn.getInputStream();
+            BufferedInputStream bis = new BufferedInputStream(inputStream);
+            //判断文件的保存路径后面是否以/结尾
+            if (!filePath.endsWith("/")) {
+
+                filePath += "/";
+
+            }
+            //写入到文件（注意文件保存路径的后面一定要加上文件的名称）
+            fileOut = new FileOutputStream(filePath+"123.png");
+            BufferedOutputStream bos = new BufferedOutputStream(fileOut);
+
+            byte[] buf = new byte[4096];
+            int length = bis.read(buf);
+            //保存文件
+            while(length != -1)
+            {
+                bos.write(buf, 0, length);
+                length = bis.read(buf);
+            }
+            bos.close();
+            bis.close();
+            conn.disconnect();
+        } catch (Exception e)
+        {
+            e.printStackTrace();
+            System.out.println("抛出异常！！");
+        }
+
+        return file;
+
+    }
+}
+
+//下载
+    private Integer downloadContract(Map map, ZcsxDataModel zcsxDataModel, Integer num, ContractTemplate contractTemplates, String format) throws Exception {
+        /*if (num != 0) {
+            String fileName = contractTemplates.getFileName();
+            String[] split = fileName.split("\\.");
+            commontUtil.exportWord(map, null, contractTemplates.getFilePath(), "C:\\Users\\nnjr0\\Downloads\\" + split[0] + "-" + (num + 1) + ".docx", zcsxDataModel);
+
+        } else {
+            commontUtil.exportWord(map, null, contractTemplates.getFilePath(), "C:\\Users\\nnjr0\\Downloads\\" + contractTemplates.getFileName(), zcsxDataModel);
+        }*/
+        String fileName = contractTemplates.getFileName();
+        String[] split = fileName.split("\\.");
+        commontUtil.exportWord(map, null, contractTemplates.getFilePath(), "D:\\ceshi\\" + split[0] + format + ".docx", zcsxDataModel);
+        return num += 1;
+    }
